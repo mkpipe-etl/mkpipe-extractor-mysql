@@ -51,7 +51,7 @@ Where `elt.yaml` is your configuration file that specifies the extractors, trans
 
 ## Documentation
 
-For more detailed documentation, please visit the [GitHub repository](https://github.com/m-karakus/mkpipe).
+For more detailed documentation, please visit the [GitHub repository](https://github.com/mkpipe-etl/mkpipe).
 
 ## License
 
