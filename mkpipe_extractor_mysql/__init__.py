@@ -25,12 +25,11 @@ class MysqlExtractor:
         self.username = self.connection_params['user']
         self.password = quote_plus(str(self.connection_params['password']))
         self.database = self.connection_params['database']
-        self.schema = self.connection_params['schema']
 
         self.driver_name = 'mysql'
         self.driver_jdbc = 'com.mysql.cj.jdbc.Driver'
 
-        self.jdbc_url = f'jdbc:{self.driver_name}://{self.host}:{self.port}/{self.database}?user={self.username}&password={self.password}&currentSchema={self.schema}'
+        self.jdbc_url = f'jdbc:{self.driver_name}://{self.host}:{self.port}/{self.database}?user={self.username}&password={self.password}'
 
     def create_spark_session(self):
         conf = SparkConf()
