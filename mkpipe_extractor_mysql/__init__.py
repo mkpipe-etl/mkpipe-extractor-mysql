@@ -28,7 +28,7 @@ class MysqlExtractor:
         self.schema = self.connection_params['schema']
 
         self.driver_name = 'mysql'
-        self.driver_jdbc = 'org.mysql.Driver'
+        self.driver_jdbc = 'com.mysql.cj.jdbc.Driver'
 
         self.jdbc_url = f'jdbc:{self.driver_name}://{self.host}:{self.port}/{self.database}?user={self.username}&password={self.password}&currentSchema={self.schema}'
 
