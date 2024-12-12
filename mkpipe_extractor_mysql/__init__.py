@@ -38,6 +38,11 @@ class MysqlExtractor:
         self.backend = get_db_connector(db_type)(connection_params)
 
     def create_spark_session(self):
+        # Stop existing session if it exists
+        existing_session = SparkSession.getActiveSession()
+        if existing_session:
+            existing_session.stop()
+
         conf = SparkConf()
         conf.setAppName(__file__)
         conf.setMaster('local[*]')
@@ -70,245 +75,156 @@ class MysqlExtractor:
         logger = Logger(__file__)
         spark = self.create_spark_session()
 
-        name = t['name']
-        target_name = t['target_name']
-        iterate_column_type = t['iterate_column_type']
-        iterate_batch_size = t.get(
-            'iterate_batch_size', self.settings.default_iterate_batch_size
-        )
-        iterate_max_loop = t.get(
-            'iterate_max_loop', self.settings.default_iterate_max_loop
-        )
-        custom_query = t.get('custom_query', None)
-        custom_query_file = t.get('custom_query_file', None)
-        if custom_query_file:
-            custom_query_file_path = os.path.abspath(
-                os.path.join(self.settings.ROOT_DIR, 'sql', custom_query_file)
+        try:
+            name = t['name']
+            target_name = t['target_name']
+            iterate_column_type = t['iterate_column_type']
+            iterate_batch_size = t.get(
+                'iterate_batch_size', self.settings.default_iterate_batch_size
             )
-            with open(custom_query_file_path, 'r') as f:
-                custom_query = f.read()
-
-        custom_partition_count = t.get(
-            'partition_count', self.settings.partitions_count
-        )
-        partitions_column_ = t.get('partitions_column')
-        fetchsize = t.get('fetchsize', 100_000)
-
-        partitions_column = partitions_column_.split(' as ')[0].strip()
-        p_col_name = partitions_column_.split(' as ')[-1].strip()
-        p_col_select = f'{partitions_column} as {p_col_name}'
-
-        message = dict(table_name=target_name, status='extracting')
-        logger.info(message)
-        parquet_path = os.path.abspath(
-            os.path.join(self.settings.ROOT_DIR, 'artifacts', target_name)
-        )
-
-        last_point = self.backend.get_last_point(target_name)
-        if last_point:
-            write_mode = 'append'
-
-            iterate_query = f"""(SELECT {p_col_select} from {name} where {partitions_column} > '{last_point}' ) q"""
-
-            df_itarate_list = (
-                spark.read.format('jdbc')
-                .option('url', self.jdbc_url)
-                .option('dbtable', iterate_query)
-                .option('driver', self.driver_jdbc)
-                .option('fetchsize', fetchsize)
-                .load()
+            iterate_max_loop = t.get(
+                'iterate_max_loop', self.settings.default_iterate_max_loop
             )
+            custom_query = t.get('custom_query', None)
+            custom_query_file = t.get('custom_query_file', None)
+            if custom_query_file:
+                custom_query_file_path = os.path.abspath(
+                    os.path.join(self.settings.ROOT_DIR, 'sql', custom_query_file)
+                )
+                with open(custom_query_file_path, 'r') as f:
+                    custom_query = f.read()
 
-            min_val = last_point
-            max_val = df_itarate_list.agg(F.max(p_col_name).alias('max')).collect()[0][
-                0
-            ]
-            df_itarate_list = df_itarate_list.where(F.col(p_col_name) > min_val)
-        else:
-            write_mode = 'overwrite'
-
-            iterate_query = f'(SELECT {p_col_select} from {name}) q'
-            df_itarate_list = (
-                spark.read.format('jdbc')
-                .option('url', self.jdbc_url)
-                .option('dbtable', iterate_query)
-                .option('driver', self.driver_jdbc)
-                .option('fetchsize', fetchsize)
-                .load()
+            custom_partition_count = t.get(
+                'partition_count', self.settings.partitions_count
             )
+            partitions_column_ = t.get('partitions_column')
+            fetchsize = t.get('fetchsize', 100_000)
 
-            min_max_vals = df_itarate_list.agg(
-                F.min(p_col_name).alias('min'), F.max(p_col_name).alias('max')
-            ).collect()[0]
-            min_val = min_max_vals[0]
-            max_val = min_max_vals[1]
-            df_itarate_list = df_itarate_list.where(F.col(p_col_name) >= min_val)
+            partitions_column = partitions_column_.split(' as ')[0].strip()
+            p_col_name = partitions_column_.split(' as ')[-1].strip()
+            p_col_select = f'{partitions_column} as {p_col_name}'
 
-        key_list = (
-            df_itarate_list.select(p_col_name)
-            .distinct()
-            .rdd.flatMap(lambda x: x)
-            .collect()
-        )
-        key_list.sort()
-
-        chunks = [
-            key_list[x : x + iterate_batch_size]
-            for x in range(0, len(key_list), iterate_batch_size)
-        ]
-
-        min_max_tuple = [(min(x), max(x)) for x in chunks]
-
-        if not min_max_tuple:
-            if not last_point:
-                # Empty table, need schema fetc
-                return self.extract_full(t)
-            else:
-                # Not empt, but no new data, all fetched before
-                data = {
-                    'table_name': target_name,
-                    'status': 'extracted',
-                    'replication_method': 'incremental',
-                }
-                return data
-
-        data = {
-            'table_name': target_name,
-            'write_mode': write_mode,
-            'file_type': 'parquet',
-            'partition_count': custom_partition_count,
-            'fetchsize': fetchsize,
-            'last_point_value': None,  # Initialize as None or the starting value
-            'iterate_column_type': iterate_column_type,
-            'loop': None,  # This will be updated each loop
-            'path': parquet_path,
-            'number_of_columns': None,
-            'number_of_rows': 0,  # Start with 0 and add to it in each loop
-            'pass_on_error': self.pass_on_error,
-            'status': 'extracted',
-            'replication_method': 'incremental',
-        }
-
-        for index, chunk in enumerate(min_max_tuple):
-            if iterate_max_loop == index:
-                break
-
-            if index == 0:
-                p_write_mode = 'overwrite'
-            else:
-                p_write_mode = 'append'
-
-            if iterate_column_type == 'int':
-                min_filter = int(chunk[0])
-                max_filter = int(chunk[-1])
-                if custom_query:
-                    updated_query = custom_query.replace(
-                        '{query_filter}',
-                        f""" where {partitions_column} between {min_filter} and {max_filter} """,
-                    )
-                else:
-                    updated_query = f'(SELECT * from {name} where  {partitions_column} between {min_filter} and {max_filter}) q'
-            else:
-                min_filter = str(chunk[0])
-                max_filter = str(chunk[-1])
-                if custom_query:
-                    updated_query = custom_query.replace(
-                        '{query_filter}',
-                        f""" where {partitions_column} between '{min_filter}' and '{max_filter}' """,
-                    )
-                else:
-                    updated_query = f"""(SELECT * from {name} where  {partitions_column} between '{min_filter}' and '{max_filter}') q"""
-
-            df = (
-                spark.read.format('jdbc')
-                .option('url', self.jdbc_url)
-                .option('dbtable', updated_query)
-                .option('driver', self.driver_jdbc)
-                .option('numPartitions', custom_partition_count)
-                .option('partitionColumn', p_col_name)
-                .option('lowerBound', min_val)
-                .option('upperBound', max_val)
-                .option('fetchsize', fetchsize)
-                .load()
-            )
-
-            # df.filter(df.cust_ord_id == 285708).select("udate").show(truncate=False)
-            # df = df.dropDuplicates() # this process affecting the partition_count be careful
-            df.write.parquet(parquet_path, mode=p_write_mode)
-            count_col = len(df.columns)
-            count_row = df.count()
-            last_point_value = max_filter
-
-            # Update `data` for this iteration
-            data['last_point_value'] = last_point_value  # update with the new max
-            data['loop'] = index  # update loop index
-            data['number_of_columns'] = count_col
-            data['number_of_rows'] += (
-                count_row  # add current loop's row count to the cumulative total
-            )
-
-            message = dict(
-                table_name=target_name,
-                status='iterrated',
-                meta_data=data,
-            )
+            message = dict(table_name=target_name, status='extracting')
             logger.info(message)
-        logger.info(data)
-        return data
-
-    def extract_full(self, t):
-        logger = Logger(__file__)
-        spark = self.create_spark_session()
-        name = t['name']
-        target_name = t['target_name']
-        message = dict(table_name=target_name, status='extracting')
-        logger.info(message)
-        custom_partition_count = t.get(
-            'partition_count', self.settings.partitions_count
-        )
-        fetchsize = t.get('fetchsize', 100_000)
-        partitions_column_ = t.get('partitions_column', None)
-
-        custom_query = t.get('custom_query', None)
-        custom_query_file = t.get('custom_query_file', None)
-        if custom_query_file:
-            custom_query_file_path = os.path.abspath(
-                os.path.join(self.settings.ROOT_DIR, 'sql', custom_query_file)
-            )
-            with open(custom_query_file_path, 'r') as f:
-                custom_query = f.read()
-
-        write_mode = 'overwrite'
-        parquet_path = os.path.abspath(
-            os.path.join(self.settings.ROOT_DIR, 'artifacts', target_name)
-        )
-
-        if not custom_query:
-            updated_query = f'(SELECT * from {name}) q'
-        else:
-            updated_query = custom_query.replace(
-                '{query_filter}',
-                ' where 1=1 ',
+            parquet_path = os.path.abspath(
+                os.path.join(self.settings.ROOT_DIR, 'artifacts', target_name)
             )
 
-        if partitions_column_:
-            partitions_column = partitions_column_.split(' as ')[0]
-            p_col_name = partitions_column_.split(' as ')[-1]
-            query_min_max = f'(SELECT min({partitions_column}), max({partitions_column}) from {name}) q'
-            df_min_max = (
-                spark.read.format('jdbc')
-                .option('url', self.jdbc_url)
-                .option('dbtable', query_min_max)
-                .option('driver', self.driver_jdbc)
-                .option('fetchsize', fetchsize)
-                .load()
+            last_point = self.backend.get_last_point(target_name)
+            if last_point:
+                write_mode = 'append'
+
+                iterate_query = f"""(SELECT {p_col_select} from {name} where {partitions_column} > '{last_point}' ) q"""
+
+                df_itarate_list = (
+                    spark.read.format('jdbc')
+                    .option('url', self.jdbc_url)
+                    .option('dbtable', iterate_query)
+                    .option('driver', self.driver_jdbc)
+                    .option('fetchsize', fetchsize)
+                    .load()
+                )
+
+                min_val = last_point
+                max_val = df_itarate_list.agg(F.max(p_col_name).alias('max')).collect()[0][
+                    0
+                ]
+                df_itarate_list = df_itarate_list.where(F.col(p_col_name) > min_val)
+            else:
+                write_mode = 'overwrite'
+
+                iterate_query = f'(SELECT {p_col_select} from {name}) q'
+                df_itarate_list = (
+                    spark.read.format('jdbc')
+                    .option('url', self.jdbc_url)
+                    .option('dbtable', iterate_query)
+                    .option('driver', self.driver_jdbc)
+                    .option('fetchsize', fetchsize)
+                    .load()
+                )
+
+                min_max_vals = df_itarate_list.agg(
+                    F.min(p_col_name).alias('min'), F.max(p_col_name).alias('max')
+                ).collect()[0]
+                min_val = min_max_vals[0]
+                max_val = min_max_vals[1]
+                df_itarate_list = df_itarate_list.where(F.col(p_col_name) >= min_val)
+
+            key_list = (
+                df_itarate_list.select(p_col_name)
+                .distinct()
+                .rdd.flatMap(lambda x: x)
+                .collect()
             )
+            key_list.sort()
 
-            min_val = df_min_max.first()['min']
-            max_val = df_min_max.first()['max']
+            chunks = [
+                key_list[x : x + iterate_batch_size]
+                for x in range(0, len(key_list), iterate_batch_size)
+            ]
 
-            if min_val:
-                # which means table not empt
+            min_max_tuple = [(min(x), max(x)) for x in chunks]
+
+            if not min_max_tuple:
+                if not last_point:
+                    # Empty table, need schema fetc
+                    return self.extract_full(t)
+                else:
+                    # Not empt, but no new data, all fetched before
+                    data = {
+                        'table_name': target_name,
+                        'status': 'extracted',
+                        'replication_method': 'incremental',
+                    }
+                    return data
+
+            data = {
+                'table_name': target_name,
+                'write_mode': write_mode,
+                'file_type': 'parquet',
+                'partition_count': custom_partition_count,
+                'fetchsize': fetchsize,
+                'last_point_value': None,  # Initialize as None or the starting value
+                'iterate_column_type': iterate_column_type,
+                'loop': None,  # This will be updated each loop
+                'path': parquet_path,
+                'number_of_columns': None,
+                'number_of_rows': 0,  # Start with 0 and add to it in each loop
+                'pass_on_error': self.pass_on_error,
+                'status': 'extracted',
+                'replication_method': 'incremental',
+            }
+
+            for index, chunk in enumerate(min_max_tuple):
+                if iterate_max_loop == index:
+                    break
+
+                if index == 0:
+                    p_write_mode = 'overwrite'
+                else:
+                    p_write_mode = 'append'
+
+                if iterate_column_type == 'int':
+                    min_filter = int(chunk[0])
+                    max_filter = int(chunk[-1])
+                    if custom_query:
+                        updated_query = custom_query.replace(
+                            '{query_filter}',
+                            f""" where {partitions_column} between {min_filter} and {max_filter} """,
+                        )
+                    else:
+                        updated_query = f'(SELECT * from {name} where  {partitions_column} between {min_filter} and {max_filter}) q'
+                else:
+                    min_filter = str(chunk[0])
+                    max_filter = str(chunk[-1])
+                    if custom_query:
+                        updated_query = custom_query.replace(
+                            '{query_filter}',
+                            f""" where {partitions_column} between '{min_filter}' and '{max_filter}' """,
+                        )
+                    else:
+                        updated_query = f"""(SELECT * from {name} where  {partitions_column} between '{min_filter}' and '{max_filter}') q"""
+
                 df = (
                     spark.read.format('jdbc')
                     .option('url', self.jdbc_url)
@@ -321,8 +237,112 @@ class MysqlExtractor:
                     .option('fetchsize', fetchsize)
                     .load()
                 )
+
+                # df.filter(df.cust_ord_id == 285708).select("udate").show(truncate=False)
+                # df = df.dropDuplicates() # this process affecting the partition_count be careful
+                df.write.parquet(parquet_path, mode=p_write_mode)
+                count_col = len(df.columns)
+                count_row = df.count()
+                last_point_value = max_filter
+
+                # Update `data` for this iteration
+                data['last_point_value'] = last_point_value  # update with the new max
+                data['loop'] = index  # update loop index
+                data['number_of_columns'] = count_col
+                data['number_of_rows'] += (
+                    count_row  # add current loop's row count to the cumulative total
+                )
+
+                message = dict(
+                    table_name=target_name,
+                    status='iterrated',
+                    meta_data=data,
+                )
+                logger.info(message)
+            logger.info(data)
+            return data
+        finally:
+            # Ensure Spark session is closed
+            spark.stop()
+
+    def extract_full(self, t):
+        logger = Logger(__file__)
+        spark = self.create_spark_session()
+        try:
+            name = t['name']
+            target_name = t['target_name']
+            message = dict(table_name=target_name, status='extracting')
+            logger.info(message)
+            custom_partition_count = t.get(
+                'partition_count', self.settings.partitions_count
+            )
+            fetchsize = t.get('fetchsize', 100_000)
+            partitions_column_ = t.get('partitions_column', None)
+
+            custom_query = t.get('custom_query', None)
+            custom_query_file = t.get('custom_query_file', None)
+            if custom_query_file:
+                custom_query_file_path = os.path.abspath(
+                    os.path.join(self.settings.ROOT_DIR, 'sql', custom_query_file)
+                )
+                with open(custom_query_file_path, 'r') as f:
+                    custom_query = f.read()
+
+            write_mode = 'overwrite'
+            parquet_path = os.path.abspath(
+                os.path.join(self.settings.ROOT_DIR, 'artifacts', target_name)
+            )
+
+            if not custom_query:
+                updated_query = f'(SELECT * from {name}) q'
             else:
-                # empty df, we need schema
+                updated_query = custom_query.replace(
+                    '{query_filter}',
+                    ' where 1=1 ',
+                )
+
+            if partitions_column_:
+                partitions_column = partitions_column_.split(' as ')[0]
+                p_col_name = partitions_column_.split(' as ')[-1]
+                query_min_max = f'(SELECT min({partitions_column}), max({partitions_column}) from {name}) q'
+                df_min_max = (
+                    spark.read.format('jdbc')
+                    .option('url', self.jdbc_url)
+                    .option('dbtable', query_min_max)
+                    .option('driver', self.driver_jdbc)
+                    .option('fetchsize', fetchsize)
+                    .load()
+                )
+
+                min_val = df_min_max.first()['min']
+                max_val = df_min_max.first()['max']
+
+                if min_val:
+                    # which means table not empt
+                    df = (
+                        spark.read.format('jdbc')
+                        .option('url', self.jdbc_url)
+                        .option('dbtable', updated_query)
+                        .option('driver', self.driver_jdbc)
+                        .option('numPartitions', custom_partition_count)
+                        .option('partitionColumn', p_col_name)
+                        .option('lowerBound', min_val)
+                        .option('upperBound', max_val)
+                        .option('fetchsize', fetchsize)
+                        .load()
+                    )
+                else:
+                    # empty df, we need schema
+                    df = (
+                        spark.read.format('jdbc')
+                        .option('url', self.jdbc_url)
+                        .option('dbtable', updated_query)
+                        .option('driver', self.driver_jdbc)
+                        .option('fetchsize', fetchsize)
+                        .load()
+                    )
+
+            else:
                 df = (
                     spark.read.format('jdbc')
                     .option('url', self.jdbc_url)
@@ -330,42 +350,35 @@ class MysqlExtractor:
                     .option('driver', self.driver_jdbc)
                     .option('fetchsize', fetchsize)
                     .load()
-                )
+                ).repartition(custom_partition_count)
 
-        else:
-            df = (
-                spark.read.format('jdbc')
-                .option('url', self.jdbc_url)
-                .option('dbtable', updated_query)
-                .option('driver', self.driver_jdbc)
-                .option('fetchsize', fetchsize)
-                .load()
-            ).repartition(custom_partition_count)
+            df.write.parquet(parquet_path, mode=write_mode)
 
-        df.write.parquet(parquet_path, mode=write_mode)
+            count_col = len(df.columns)
+            count_row = df.count()
 
-        count_col = len(df.columns)
-        count_row = df.count()
-
-        data = {
-            'table_name': target_name,
-            'path': parquet_path,
-            'file_type': 'parquet',
-            'number_of_columns': count_col,
-            'number_of_rows': count_row,
-            'write_mode': write_mode,
-            'partition_count': custom_partition_count,
-            'fetchsize': fetchsize,
-            'pass_on_error': self.pass_on_error,
-            'replication_method': 'full',
-        }
-        message = dict(
-            table_name=target_name,
-            status='extracted',
-            meta_data=data,
-        )
-        logger.info(message)
-        return data
+            data = {
+                'table_name': target_name,
+                'path': parquet_path,
+                'file_type': 'parquet',
+                'number_of_columns': count_col,
+                'number_of_rows': count_row,
+                'write_mode': write_mode,
+                'partition_count': custom_partition_count,
+                'fetchsize': fetchsize,
+                'pass_on_error': self.pass_on_error,
+                'replication_method': 'full',
+            }
+            message = dict(
+                table_name=target_name,
+                status='extracted',
+                meta_data=data,
+            )
+            logger.info(message)
+            return data
+        finally:
+            # Ensure Spark session is closed
+            spark.stop()
 
     @log_container(__file__)
     def extract(self):
