@@ -1,14 +1,15 @@
 import os
-from pathlib import Path
 import datetime
-from pyspark.sql import SparkSession
+from pathlib import Path
 from urllib.parse import quote_plus
+from pyspark.sql import SparkSession
 from pyspark import SparkConf
-
-from mkpipe.utils import log_container, Logger
-from mkpipe.functions_db import get_table_status, get_last_point, manifest_table_update
-from mkpipe.utils.base_class import PipeSettings
 import pyspark.sql.functions as F
+
+from mkpipe.config import load_config
+from mkpipe.utils import log_container, Logger
+from mkpipe.functions_db import get_db_connector
+from mkpipe.utils.base_class import PipeSettings
 
 
 class MysqlExtractor:
@@ -30,6 +31,11 @@ class MysqlExtractor:
         self.driver_jdbc = 'com.mysql.cj.jdbc.Driver'
 
         self.jdbc_url = f'jdbc:{self.driver_name}://{self.host}:{self.port}/{self.database}?user={self.username}&password={self.password}'
+
+        config = load_config()
+        connection_params = config['settings']['backend']
+        db_type = connection_params['database_type']
+        self.backend = get_db_connector(db_type)(connection_params)
 
     def create_spark_session(self):
         conf = SparkConf()
@@ -98,7 +104,7 @@ class MysqlExtractor:
             os.path.join(self.settings.ROOT_DIR, 'artifacts', target_name)
         )
 
-        last_point = get_last_point(target_name)
+        last_point = self.backend.get_last_point(target_name)
         if last_point:
             write_mode = 'append'
 
@@ -370,7 +376,7 @@ class MysqlExtractor:
         try:
             target_name = t['target_name']
             replication_method = t.get('replication_method', None)
-            if get_table_status(target_name) in ['extracting', 'loading']:
+            if self.backend.get_table_status(target_name) in ['extracting', 'loading']:
                 logger.info(
                     {'message': f'Skipping {target_name}, already in progress...'}
                 )
@@ -381,7 +387,7 @@ class MysqlExtractor:
                 }
                 return data
 
-            manifest_table_update(
+            self.backend.manifest_table_update(
                 name=target_name,
                 value=None,  # Last point remains unchanged
                 value_type=None,  # Type remains unchanged
@@ -402,7 +408,7 @@ class MysqlExtractor:
                 error_message=str(e),
                 etl_start_time=str(extract_start_time),
             )
-            manifest_table_update(
+            self.backend.manifest_table_update(
                 target_name,
                 None,
                 None,
