@@ -10,7 +10,7 @@ from mkpipe.config import load_config
 from mkpipe.utils import log_container, Logger
 from mkpipe.functions_db import get_db_connector
 from mkpipe.utils.base_class import PipeSettings
-
+from mkpipe.plugins import collect_jars
 
 class MysqlExtractor:
     def __init__(self, config, settings):
@@ -38,19 +38,15 @@ class MysqlExtractor:
         self.backend = get_db_connector(db_type)(connection_params)
 
     def create_spark_session(self):
-        # Stop existing session if it exists
-        existing_session = SparkSession.getActiveSession()
-        if existing_session:
-            existing_session.stop()
-
+        jars = collect_jars()
         conf = SparkConf()
         conf.setAppName(__file__)
         conf.setMaster('local[*]')
         conf.set('spark.driver.memory', self.settings.spark_driver_memory)
         conf.set('spark.executor.memory', self.settings.spark_executor_memory)
-        script_dir = Path(__file__).parent  # Directory where the script is located
-        jars_path = script_dir / 'jars'  # Path to the jars folder
-        conf.set('spark.driver.extraClassPath', str(jars_path) + '/*')
+        conf.set('spark.jars', jars)
+        conf.set('spark.driver.extraClassPath', jars)
+        conf.set('spark.executor.extraClassPath', jars)
         conf.set('spark.network.timeout', '600s')
         conf.set('spark.sql.parquet.datetimeRebaseModeInRead', 'CORRECTED')
         conf.set('spark.sql.parquet.datetimeRebaseModeInWrite', 'CORRECTED')
