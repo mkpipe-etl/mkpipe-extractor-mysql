@@ -1,11 +1,12 @@
-from mkpipe.functions_spark import BaseExtractor
+from mkpipe.spark import JdbcExtractor
 
 
-class MysqlExtractor(BaseExtractor):
-    def __init__(self, config, settings):
-        super().__init__(
-            config,
-            settings,
-            driver_name='mysql',
-            driver_jdbc='com.mysql.cj.jdbc.Driver',
+class MysqlExtractor(JdbcExtractor, variant='mysql'):
+    driver_name = 'mysql'
+    driver_jdbc = 'com.mysql.cj.jdbc.Driver'
+
+    def build_jdbc_url(self):
+        return (
+            f'jdbc:{self.driver_name}://{self.host}:{self.port}/{self.database}'
+            f'?user={self.username}&password={self.password}'
         )
