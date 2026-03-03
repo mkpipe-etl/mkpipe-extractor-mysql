@@ -1,5 +1,7 @@
 from mkpipe.spark import JdbcExtractor
 
+JAR_PACKAGES = ['com.mysql:mysql-connector-j:9.1.0']
+
 
 class MysqlExtractor(JdbcExtractor, variant='mysql'):
     driver_name = 'mysql'
